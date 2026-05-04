@@ -24,12 +24,15 @@ shipped silently.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import Callable
 from datetime import datetime
+from typing import cast
 
 from anthropic.types import (
+    ContentBlock,
     InputJSONDelta,
     RawContentBlockDeltaEvent,
     RawContentBlockStartEvent,
@@ -39,13 +42,23 @@ from anthropic.types import (
     RawMessageStopEvent,
     RawMessageStreamEvent,
     SignatureDelta,
+    StopReason,
     TextDelta,
     ThinkingDelta,
 )
+from anthropic.types import (
+    Message as AnthropicMessage,
+)
 from anthropic.types import RedactedThinkingBlock as AnthropicRedactedThinkingBlock
 from anthropic.types import ServerToolUseBlock as AnthropicServerToolUseBlock
+from anthropic.types import (
+    TextBlock as AnthropicTextBlock,
+)
 from anthropic.types import ThinkingBlock as AnthropicThinkingBlock
 from anthropic.types import ToolUseBlock as AnthropicToolUseBlock
+from anthropic.types import (
+    Usage as AnthropicUsage,
+)
 
 from ..events import (
     Aggregator,
@@ -65,7 +78,7 @@ from ..events import (
 _logger = logging.getLogger(__name__)
 
 
-class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
+class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, AnthropicMessage]):
     """Aggregate raw Anthropic stream events and emit unified Event objects.
 
     Handles text, thinking, tool_use, and server_tool_use content blocks
@@ -107,8 +120,35 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
         # emitted as a single ModelCallFinishedEvent at message_stop.
         self._model_name: str | None = None
         self._model_call_id: str | None = None
-        self._stop_reason: str | None = None
-        self._usage: dict[str, object] | None = None
+        # Keep SDK's narrow Literal type — assigned only from
+        # ``RawMessageDeltaEvent.delta.stop_reason`` which IS this type, so
+        # the constructor below needs no cast and stays type-safe.
+        self._stop_reason: StopReason | None = None
+        # Store usage as the SDK ``Usage`` object directly. ``message_start``
+        # provides initial input/cache totals; ``message_delta`` ships the
+        # cumulative output tokens at the end. We merge by mutating fields
+        # in place (Pydantic v2 BaseModels are mutable), which keeps the
+        # type strict as ``Usage`` instead of falling back to a dict.
+        self._usage: AnthropicUsage | None = None
+        # Per-block content accumulators for ``build() -> Message`` (RFC-0023
+        # §阶段 ③). Each entry is a strict SDK block type — pydantic v2
+        # BaseModels are mutable so we can update fields as deltas arrive
+        # without intermediate ``dict[str, object]`` plumbing. Mirrors the
+        # OpenAI Chat aggregator's pattern of storing ``ChatCompletionChoice``
+        # directly and mutating it in place.
+        #
+        # Index reuse (e.g. thinking + tool both at idx 0 in
+        # rec_single_tool_call) is preserved because each block is sealed at
+        # its own content_block_stop and appended to the ordered list before
+        # the next ``content_block_start`` at the same index opens a fresh
+        # accumulator.
+        self._active_payloads: dict[int, ContentBlock] = {}
+        self._completed_payloads: list[ContentBlock] = []
+        # Tool args still buffered as raw text (input_json_delta arrives as
+        # text fragments; parsed at seal time). Kept separate from the
+        # ToolUseBlock's typed ``input: dict`` so we don't lose unparsed
+        # state mid-stream.
+        self._tool_args_per_index: dict[int, str] = {}
 
     def aggregate(self, item: RawMessageStreamEvent) -> None:
         """Process a single raw stream event."""
@@ -126,9 +166,77 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
             case RawMessageStopEvent():
                 self._handle_message_stop()
 
-    def build(self) -> None:
-        """Not used — events are emitted via on_event callback."""
-        return None
+    def build(self) -> AnthropicMessage:
+        """Construct the final Anthropic Message from accumulated stream state.
+
+        RFC-0023 §阶段 ③ — Set A becomes the canonical aggregator. The
+        returned object is a strict ``anthropic.types.Message``; downstream
+        code that wants a unified ``ModelResponse`` calls
+        ``ModelResponse.from_anthropic_message(aggregator.build())``.
+
+        Block ordering follows wire index (Anthropic streams blocks in
+        order with explicit ``index`` fields). Blocks that were started but
+        never received a ``content_block_stop`` are still emitted (mirrors
+        Set B's ``_flush_active_blocks`` at finalize) so truncated streams
+        produce a structurally-valid Message.
+        """
+        return self._construct_message()
+
+    def _construct_message(self) -> AnthropicMessage:
+        # ``_completed_payloads`` already holds typed SDK ContentBlocks in
+        # wire order (sealed at content_block_stop); pass through verbatim.
+        # Index reuse (e.g. thinking + tool_use both at idx 0 in
+        # rec_single_tool_call) is preserved because each block was sealed
+        # before the next start at the same index opened a fresh accumulator.
+        content_blocks: list[ContentBlock] = list(self._completed_payloads)
+
+        # Usage: ``_usage`` is already the SDK ``Usage`` object (mutated as
+        # message_start + message_delta arrived). Default to an empty Usage
+        # if the stream lacked both events (e.g. truncated transport).
+        usage = self._usage if self._usage is not None else AnthropicUsage(input_tokens=0, output_tokens=0)
+
+        return AnthropicMessage(
+            id=self._message_id or self._model_call_id or "",
+            type="message",
+            role="assistant",
+            content=content_blocks,
+            model=self._model_name or "",
+            stop_reason=self._stop_reason,
+            stop_sequence=None,
+            usage=usage,
+        )
+
+    def _parse_tool_input(self, idx: int) -> dict[str, object]:
+        """Parse the buffered ``input_json_delta`` text for a tool block.
+
+        Mirrors Set B's recovery path: try strict json.loads, then
+        ``raw_decode`` to extract the first JSON object (eager_input_streaming
+        can append junk), then return ``{"_raw": ...}`` as last resort.
+        """
+        buffer = self._tool_args.get(idx, "")
+        if not buffer:
+            return {}
+        # Type ``parsed`` as ``object`` so mypy/pyright treat narrowing
+        # strictly — ``json.loads`` would otherwise propagate ``Any`` and
+        # poison downstream type inference.
+        parsed: object
+        try:
+            parsed = json.loads(buffer)
+        except json.JSONDecodeError:
+            try:
+                first_obj, _ = json.JSONDecoder().raw_decode(buffer.lstrip())
+                parsed = first_obj
+            except (json.JSONDecodeError, ValueError):
+                return {"_raw": buffer}
+        # JSON spec guarantees string keys, but isinstance(parsed, dict) only
+        # narrows to dict[Unknown, Unknown]. Cast to widen-to-strict-shape so
+        # the comprehension lands on the SDK's expected ``dict[str, object]``.
+        # The cast is justified: the runtime check above proves parsed is dict;
+        # the cast only refines the parametric types mypy/pyright can't infer.
+        if isinstance(parsed, dict):
+            typed_parsed = cast(dict[object, object], parsed)
+            return {str(k): v for k, v in typed_parsed.items()}
+        return {"_raw": buffer}
 
     def clear(self) -> None:
         """Reset aggregator state for reuse."""
@@ -149,6 +257,9 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
         self._model_call_id = None
         self._stop_reason = None
         self._usage = None
+        self._active_payloads.clear()
+        self._completed_payloads.clear()
+        self._tool_args_per_index.clear()
 
     # ---- Internal handlers ----
 
@@ -160,10 +271,9 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
         # Capture per-call metadata for ModelCallFinishedEvent (RFC-0023 §阶段 ②)
         self._model_call_id = event.message.id
         self._model_name = event.message.model
-        try:
-            self._usage = event.message.usage.model_dump() if event.message.usage else None
-        except AttributeError:
-            self._usage = None
+        # ``event.message.usage`` is the SDK ``Usage`` (non-Optional). Copy
+        # so subsequent message_delta merges don't mutate the source object.
+        self._usage = event.message.usage.model_copy()
         if not self._started:
             self._started = True
             self._on_event(
@@ -183,9 +293,21 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
         if event.delta.stop_reason:
             self._stop_reason = event.delta.stop_reason
         if event.usage:
-            # Merge cumulative usage on top of message_start's snapshot
-            # (Anthropic streams cumulative output_tokens here).
-            self._usage = (self._usage or {}) | event.usage.model_dump()
+            # ``event.usage`` (MessageDeltaUsage) ships the cumulative
+            # output_tokens at end-of-stream; merge into our running Usage by
+            # field. MessageDeltaUsage's fields overlap Usage but are a strict
+            # subset, so we copy through any non-None values.
+            if self._usage is None:
+                # No message_start usage seen — synthesize a fresh Usage with
+                # zero input tokens and the delta-supplied output tokens.
+                self._usage = AnthropicUsage(input_tokens=0, output_tokens=event.usage.output_tokens or 0)
+            else:
+                # Field-level mutation. Only output_tokens / cache_*_tokens are
+                # commonly updated by message_delta; copy any non-None field.
+                for field in event.usage.model_fields_set:
+                    new_value = getattr(event.usage, field, None)
+                    if new_value is not None:
+                        setattr(self._usage, field, new_value)
 
     # ---- Tool registration helpers ----
 
@@ -243,18 +365,39 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
         block = event.content_block
         self._block_types[idx] = block.type
 
+        # If this index is reused (e.g. thinking → tool_use both at idx 0 in
+        # rec_single_tool_call), seal the previous in-flight payload first
+        # so it survives in _completed_payloads. Without this we'd silently
+        # overwrite the prior block.
+        if idx in self._active_payloads:
+            self._completed_payloads.append(self._active_payloads.pop(idx))
+
         match block:
             case AnthropicToolUseBlock():
                 self._register_tool_and_flush(idx, block.id, block.name)
+                # Pre-allocate the SDK ToolUseBlock; ``input`` filled at
+                # content_block_stop after the JSON delta buffer is parsed.
+                self._active_payloads[idx] = AnthropicToolUseBlock(
+                    type="tool_use",
+                    id=block.id,
+                    name=block.name,
+                    input={},
+                )
             case AnthropicServerToolUseBlock():
                 # 服务端工具（web_search、code_execution 等）使用相同的 id/name 接口
                 self._register_tool_and_flush(idx, block.id, block.name)
+                self._active_payloads[idx] = block.model_copy()
             case AnthropicThinkingBlock():
                 thinking_id = str(uuid.uuid4())
                 self._thinking_ids[idx] = thinking_id
-                # Capture inline signature if the start block ships one
-                # (rare; usually arrives via SignatureDelta later).
-                if getattr(block, "signature", None):
+                # Pre-allocate; ``thinking`` text appended via deltas, ``signature``
+                # set when SignatureDelta arrives (or inline on this start).
+                self._active_payloads[idx] = AnthropicThinkingBlock(
+                    type="thinking",
+                    thinking=block.thinking or "",
+                    signature=block.signature or "",
+                )
+                if block.signature:
                     self._thinking_signatures[idx] = block.signature
                 self._on_event(
                     ThinkingTextMessageStartEvent(
@@ -272,7 +415,11 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
                 thinking_id = str(uuid.uuid4())
                 self._thinking_ids[idx] = thinking_id
                 self._thinking_is_redacted[idx] = True
-                if getattr(block, "data", None):
+                self._active_payloads[idx] = AnthropicRedactedThinkingBlock(
+                    type="redacted_thinking",
+                    data=block.data or "",
+                )
+                if block.data:
                     self._thinking_redacted_data[idx] = block.data
                 # Re-tag for the stop handler — RedactedThinkingBlock.type is
                 # "redacted_thinking" but our close path keys on "thinking".
@@ -296,6 +443,17 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
             case TextDelta(text=text):
                 if not text:
                     return
+                # Mark this index as a text block (covers the case where the
+                # corresponding content_block_start hasn't been processed yet).
+                self._block_types.setdefault(idx, "text")
+                # Retain content for build() (RFC-0023 §阶段 ③). Mutate the
+                # SDK TextBlock in place — pre-allocated here if the start
+                # event hasn't been processed.
+                existing = self._active_payloads.get(idx)
+                if isinstance(existing, AnthropicTextBlock):
+                    existing.text += text
+                else:
+                    self._active_payloads[idx] = AnthropicTextBlock(type="text", text=text, citations=None)
                 self._on_event(
                     TextMessageContentEvent(
                         message_id=self._message_id,
@@ -344,6 +502,17 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
                             timestamp=self._ts(),
                         )
                     )
+                # Retain content for build() — mutate the SDK ThinkingBlock
+                # in place; pre-allocate if start event hasn't run yet.
+                existing = self._active_payloads.get(idx)
+                if isinstance(existing, AnthropicThinkingBlock):
+                    existing.thinking += thinking
+                else:
+                    self._active_payloads[idx] = AnthropicThinkingBlock(
+                        type="thinking",
+                        thinking=thinking,
+                        signature="",
+                    )
                 self._on_event(
                     ThinkingTextMessageContentEvent(
                         thinking_message_id=thinking_id,
@@ -356,6 +525,19 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
                 # the replay-auth signature for the block. Stash for End.
                 if sig:
                     self._thinking_signatures[idx] = sig
+                    existing = self._active_payloads.get(idx)
+                    if isinstance(existing, AnthropicThinkingBlock):
+                        existing.signature = sig
+                    else:
+                        # Lazy: ThinkingBlock pre-alloc happens in start handler;
+                        # SignatureDelta arriving without a thinking payload is
+                        # an unusual wire shape (covered by the lazy synthesis
+                        # branch in the ThinkingDelta case above).
+                        self._active_payloads[idx] = AnthropicThinkingBlock(
+                            type="thinking",
+                            thinking="",
+                            signature=sig,
+                        )
             case _:
                 pass
 
@@ -397,6 +579,20 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
                 )
             )
 
+        # Seal the in-flight payload (RFC-0023 §阶段 ③) — this finalizes
+        # the block for build(). If the block is a tool, the input JSON
+        # gets parsed here.
+        self._seal_active_payload(idx)
+
+    def _seal_active_payload(self, idx: int) -> None:
+        payload = self._active_payloads.pop(idx, None)
+        if payload is None:
+            return
+        # Parse buffered tool input now (mirrors Set B's _finalize_block).
+        if isinstance(payload, AnthropicToolUseBlock | AnthropicServerToolUseBlock):
+            payload.input = self._parse_tool_input(idx)
+        self._completed_payloads.append(payload)
+
     def _handle_message_stop(self) -> None:
         # Flush any remaining buffered deltas that never received content_block_start
         for idx in list(self._pending_tool_deltas):
@@ -416,6 +612,10 @@ class AnthropicEventAggregator(Aggregator[RawMessageStreamEvent, None]):
                         timestamp=self._ts(),
                     )
                 )
+        # Flush any active payloads that didn't see content_block_stop —
+        # truncated streams (max_tokens, network cut) leave blocks in-flight.
+        for idx in list(self._active_payloads):
+            self._seal_active_payload(idx)
         # Emit message end
         self._on_event(
             TextMessageEndEvent(

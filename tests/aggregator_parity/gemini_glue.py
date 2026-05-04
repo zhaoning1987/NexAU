@@ -30,7 +30,7 @@ Gemini wire format quirks captured by these recordings:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from nexau.archs.llm.llm_aggregators import GeminiRestEventAggregator
 from nexau.archs.llm.llm_aggregators.events import Event
@@ -39,13 +39,16 @@ from nexau.archs.main_sub.execution.llm_caller import GeminiRestStreamAggregator
 
 def run_set_a_gemini(events: list[dict[str, Any]]) -> list[Event]:
     """Feed chunks into Set A's GeminiRestEventAggregator and collect events."""
+    from nexau.archs.llm.llm_aggregators.gemini_rest.gemini_rest_event_aggregator import GeminiResponse
+
     collected: list[Event] = []
     aggregator = GeminiRestEventAggregator(
         on_event=collected.append,
         run_id="parity-test-run",
     )
     for chunk in events:
-        aggregator.aggregate(chunk)
+        # Wire dicts conform to GeminiResponse shape; cast at the boundary.
+        aggregator.aggregate(cast(GeminiResponse, chunk))
     return collected
 
 

@@ -20,7 +20,7 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import datetime
-from typing import TYPE_CHECKING, TypeGuard
+from typing import TYPE_CHECKING, TypeGuard, cast
 
 from openai.types.chat import ChatCompletionChunk
 from openai.types.responses import ResponseStreamEvent
@@ -318,7 +318,13 @@ class AgentEventsMiddleware(Middleware):
 
         if is_gemini_rest_chunk(chunk):
             gemini_aggregator = self.gemini_rest_aggregator(run_id=run_id)
-            gemini_aggregator.aggregate(chunk)
+            # ``GeminiRestEventAggregator.aggregate`` is typed against the
+            # strict ``GeminiResponse`` TypedDict; the wire-level dict has
+            # the right shape but isn't statically narrowed past
+            # ``dict[str, object]``. Cast at the boundary.
+            from nexau.archs.llm.llm_aggregators.gemini_rest.gemini_rest_event_aggregator import GeminiResponse  # noqa: PLC0415
+
+            gemini_aggregator.aggregate(cast(GeminiResponse, chunk))
 
         if is_anthropic_event(chunk):
             anthropic_agg = self.anthropic_aggregator(run_id=run_id)

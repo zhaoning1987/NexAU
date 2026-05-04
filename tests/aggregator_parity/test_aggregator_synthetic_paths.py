@@ -479,7 +479,15 @@ def test_gemini_handles_chunk_without_content() -> None:
 
 
 def test_gemini_handles_malformed_parts() -> None:
-    """Gemini parts that are not dicts / non-list parts are skipped."""
+    """Gemini parts that are not dicts / non-list parts are skipped.
+
+    These payloads deliberately violate ``GeminiResponse`` to exercise
+    the aggregator's defensive runtime guards; cast to satisfy mypy.
+    """
+    from typing import cast
+
+    from nexau.archs.llm.llm_aggregators.gemini_rest.gemini_rest_event_aggregator import GeminiResponse
+
     agg = GeminiRestEventAggregator(on_event=Mock(), run_id="run-1")
-    agg.aggregate({"candidates": [{"content": {"parts": ["not_a_dict", {"text": "hi"}]}}]})
-    agg.aggregate({"candidates": [{"content": {"parts": "not-a-list"}}]})
+    agg.aggregate(cast(GeminiResponse, {"candidates": [{"content": {"parts": ["not_a_dict", {"text": "hi"}]}}]}))
+    agg.aggregate(cast(GeminiResponse, {"candidates": [{"content": {"parts": "not-a-list"}}]}))

@@ -153,9 +153,19 @@ class TestAnthropicEventAggregatorInit:
         assert agg._block_types == {}
         assert agg._tool_ids == {}
 
-    def test_build_returns_none(self):
+    def test_build_returns_empty_message_on_no_events(self):
+        """RFC-0023 §阶段 ③: build() now returns an Anthropic Message reconstructed
+        from accumulated stream state. With no events fed, all fields default
+        to empty/zero — no exception."""
+        from anthropic.types import Message as AnthropicMessage
+
         agg = AnthropicEventAggregator(on_event=Mock(), run_id="run_1")
-        assert agg.build() is None
+        msg = agg.build()
+        assert isinstance(msg, AnthropicMessage)
+        assert msg.role == "assistant"
+        assert msg.content == []
+        assert msg.usage.input_tokens == 0
+        assert msg.usage.output_tokens == 0
 
     def test_clear_resets_all_state(self):
         on_event = Mock()

@@ -533,7 +533,7 @@ def collect_weak_gaps(
     These are the targets for RFC-0023 §阶段 ② event extensions.
 
     With §阶段 ② landed, Set A emits ``ModelCallFinishedEvent`` carrying
-    ``model_name`` / ``stop_reason`` / ``usage`` / ``llm_call_id``. We scan
+    ``model_name`` / ``stop_reason`` / ``model_call_id``. We scan
     ``agui_events`` for that event and only flag a gap if Set B has the
     field set but Set A's event doesn't carry an equivalent. Synthetic
     fixtures that don't surface metadata on either side stay clean.

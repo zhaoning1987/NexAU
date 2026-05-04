@@ -29,9 +29,10 @@ import json
 import uuid
 from collections.abc import Callable
 from datetime import datetime
-from typing import cast
+from typing import TypedDict
 
 from ..events import (
+    Aggregator,
     Event,
     ModelCallFinishedEvent,
     TextMessageContentEvent,
@@ -45,8 +46,65 @@ from ..events import (
     ToolCallStartEvent,
 )
 
+# ============================================================================
+# Typed shape of the Gemini generateContent / streamGenerateContent response.
+# Gemini has no SDK-typed object (unlike Anthropic's ``Message`` or OpenAI's
+# ``ChatCompletion``); the wire format is raw JSON. These TypedDicts pin the
+# shape statically so the aggregator never touches ``dict[str, object]`` /
+# ``dict[str, Any]`` unconstrained — strict typing parity with the OpenAI
+# Chat aggregator. Fields marked ``NotRequired`` reflect Gemini's actual wire
+# behavior (e.g. a chunk may omit ``content`` if it carries only finishReason).
+# ============================================================================
 
-class GeminiRestEventAggregator:
+
+class GeminiFunctionCall(TypedDict):
+    name: str
+    args: dict[str, object]
+
+
+class GeminiPart(TypedDict, total=False):
+    """One element of ``content.parts``. Wire fields are unioned: a single
+    part may carry text + thought, only thoughtSignature, only functionCall,
+    etc. ``total=False`` because no single field is universally present."""
+
+    text: str
+    thought: bool
+    thoughtSignature: str
+    functionCall: GeminiFunctionCall
+
+
+class GeminiContent(TypedDict, total=False):
+    parts: list[GeminiPart]
+    # ``role`` is always present on real wire but synthetic test fixtures
+    # commonly omit it; mark NotRequired via ``total=False``.
+    role: str
+
+
+class GeminiCandidate(TypedDict, total=False):
+    content: GeminiContent
+    finishReason: str
+    index: int
+
+
+class GeminiUsageMetadata(TypedDict, total=False):
+    promptTokenCount: int
+    candidatesTokenCount: int
+    totalTokenCount: int
+    thoughtsTokenCount: int
+    promptTokensDetails: list[dict[str, object]]
+
+
+class GeminiResponse(TypedDict, total=False):
+    """Strict shape of one Gemini SSE chunk (and equivalently the non-stream
+    ``generateContent`` response). ``build()`` returns this shape verbatim."""
+
+    candidates: list[GeminiCandidate]
+    usageMetadata: GeminiUsageMetadata
+    modelVersion: str
+    responseId: str
+
+
+class GeminiRestEventAggregator(Aggregator[GeminiResponse, GeminiResponse]):
     """Aggregates Gemini REST streaming dict chunks and emits unified events.
 
     RFC-0003: Gemini REST 流式事件聚合器
@@ -71,83 +129,99 @@ class GeminiRestEventAggregator:
         self._model_name: str | None = None
         self._model_call_id: str | None = None
         self._finish_reason: str | None = None
-        self._usage: dict[str, object] | None = None
+        self._usage: GeminiUsageMetadata | None = None
         # Thinking signature stored per chunk; attached to End event.
         self._thought_signature: str | None = None
         # Whether ModelCallFinishedEvent has fired (idempotent guard — _handle_finish
         # may run multiple times if chunks repeat finishReason).
         self._metadata_emitted = False
+        # Per-call content accumulators for ``build() -> GeminiResponse`` (RFC-0023
+        # §阶段 ③). Mirror Set B's GeminiRestStreamAggregator structure so
+        # the dict ``build()`` returns is byte-equivalent to Set B's
+        # ``finalize()`` output (and round-trips through
+        # ``ModelResponse.from_gemini_rest`` identically).
+        self._content_text_parts: list[str] = []
+        self._reasoning_text_parts: list[str] = []
+        self._tool_call_parts: list[GeminiPart] = []
 
-    def aggregate(self, chunk: dict[str, object]) -> None:
+    def aggregate(self, item: GeminiResponse) -> None:
         """Process a single Gemini REST streaming chunk and emit events.
 
         RFC-0003: 处理单个 Gemini 流式数据块并发射事件
 
         Args:
-            chunk: Parsed JSON dict from a Gemini SSE data line
+            item: Parsed JSON chunk from a Gemini SSE data line, conforming
+                to ``GeminiResponse``. Wire dicts that don't match the
+                TypedDict shape are tolerated (TypedDict is structural at
+                runtime — bad shapes just fall through the isinstance/key
+                guards below).
         """
+        chunk = item
         # 0. Accumulate cross-chunk metadata (RFC-0023 §阶段 ②)
-        if isinstance(chunk.get("modelVersion"), str):
-            self._model_name = cast(str, chunk["modelVersion"])
-        if isinstance(chunk.get("responseId"), str):
-            self._model_call_id = cast(str, chunk["responseId"])
+        model_version = chunk.get("modelVersion")
+        if isinstance(model_version, str):
+            self._model_name = model_version
+        response_id = chunk.get("responseId")
+        if isinstance(response_id, str):
+            self._model_call_id = response_id
         usage_md = chunk.get("usageMetadata")
         if isinstance(usage_md, dict):
-            self._usage = cast(dict[str, object], usage_md)
+            self._usage = usage_md
 
-        # 1. 提取 candidates
-        candidates_raw = chunk.get("candidates")
-        if not isinstance(candidates_raw, list) or not candidates_raw:
+        # 1. 提取 candidates. The TypedDict promises ``list[GeminiCandidate]``
+        # but the wire JSON can be malformed; defensively isinstance-guard.
+        # ``# pyright: ignore[reportUnnecessaryIsInstance]`` suppresses
+        # pyright's "TypedDict already implies the type" warning — TypedDict
+        # gives static narrowing, NOT runtime validation, so the guard is
+        # real protection against bad wire data.
+        candidates = chunk.get("candidates")
+        if not isinstance(candidates, list) or not candidates:  # pyright: ignore[reportUnnecessaryIsInstance]
+            return
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
             return
 
-        candidates_list = cast(list[object], candidates_raw)
-        candidate_obj = candidates_list[0]
-        if not isinstance(candidate_obj, dict):
-            return
-        candidate_dict = cast(dict[str, object], candidate_obj)
-
-        content_obj = candidate_dict.get("content")
-        if not isinstance(content_obj, dict):
+        content = candidate.get("content")
+        if not isinstance(content, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
             # finishReason 可能在没有 content 的 chunk 中
-            finish_reason = candidate_dict.get("finishReason")
+            finish_reason = candidate.get("finishReason")
             if isinstance(finish_reason, str) and finish_reason:
                 self._finish_reason = finish_reason
                 self._handle_finish()
             return
-        content_dict = cast(dict[str, object], content_obj)
 
-        parts = content_dict.get("parts")
-        if not isinstance(parts, list):
+        parts = content.get("parts")
+        if not isinstance(parts, list):  # pyright: ignore[reportUnnecessaryIsInstance]
             return
 
         # 2. 遍历 parts，分类处理并发射事件
-        for part_obj in cast(list[object], parts):
-            if not isinstance(part_obj, dict):
+        for part in parts:
+            if not isinstance(part, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
                 continue
-            part_dict = cast(dict[str, object], part_obj)
 
             # Gemini sometimes emits a part containing ONLY thoughtSignature
             # (no text / no functionCall) as a sibling to a thinking text part.
             # Capture it for the ThinkingTextMessageEndEvent regardless of
             # whether the part also carries content.
-            sig = part_dict.get("thoughtSignature")
+            sig = part.get("thoughtSignature")
             if isinstance(sig, str) and sig:
                 self._thought_signature = sig
 
-            is_thought = part_dict.get("thought") is True
-            has_text = "text" in part_dict
-            has_function_call = "functionCall" in part_dict
+            is_thought = part.get("thought") is True
+            has_text = "text" in part
+            has_function_call = "functionCall" in part
 
             if is_thought and has_text:
-                self._handle_thinking_part(part_dict)
+                self._handle_thinking_part(part)
             elif has_text and not is_thought:
-                self._handle_text_part(part_dict)
+                self._handle_text_part(part)
             elif has_function_call:
-                self._handle_function_call_part(part_dict)
+                self._handle_function_call_part(part)
 
         # 3. 检查 finish reason
-        finish_reason = candidate_dict.get("finishReason")
+        finish_reason = candidate.get("finishReason")
         if isinstance(finish_reason, str) and finish_reason:
+            self._finish_reason = finish_reason
             self._handle_finish()
 
     def clear(self) -> None:
@@ -168,6 +242,43 @@ class GeminiRestEventAggregator:
         self._usage = None
         self._thought_signature = None
         self._metadata_emitted = False
+        self._content_text_parts.clear()
+        self._reasoning_text_parts.clear()
+        self._tool_call_parts.clear()
+
+    def build(self) -> GeminiResponse:
+        """Construct the aggregated Gemini generateContent response (RFC-0023 §阶段 ③).
+
+        The returned shape mirrors a non-streaming ``generateContent`` response
+        and is byte-equivalent to ``llm_caller.GeminiRestStreamAggregator``'s
+        ``finalize()`` output (axis-4 parity verifies this). Downstream code
+        that wants a unified ``ModelResponse`` calls
+        ``ModelResponse.from_gemini_rest(aggregator.build())``.
+
+        Mirrors Set B exactly:
+        - reasoning text → single concatenated thought=true part
+        - thoughtSignature → its own part (if seen)
+        - content text → single concatenated part
+        - tool calls → preserved in stream order (full ``GeminiPart`` entries)
+        """
+        parts: list[GeminiPart] = []
+        if self._reasoning_text_parts:
+            parts.append({"text": "".join(self._reasoning_text_parts), "thought": True})
+        if self._thought_signature is not None:
+            parts.append({"thoughtSignature": self._thought_signature})
+        if self._content_text_parts:
+            parts.append({"text": "".join(self._content_text_parts)})
+        parts.extend(self._tool_call_parts)
+
+        candidate: GeminiCandidate = {"content": {"parts": parts, "role": "model"}}
+        result: GeminiResponse = {"candidates": [candidate]}
+        if self._usage is not None:
+            result["usageMetadata"] = self._usage
+        if self._model_name is not None:
+            result["modelVersion"] = self._model_name
+        if self._model_call_id is not None:
+            result["responseId"] = self._model_call_id
+        return result
 
     def _ensure_message_started(self) -> None:
         """Emit TextMessageStartEvent on first content of any kind."""
@@ -202,11 +313,14 @@ class GeminiRestEventAggregator:
                 )
             )
 
-    def _handle_text_part(self, part: dict[str, object]) -> None:
+    def _handle_text_part(self, part: GeminiPart) -> None:
         """Emit text content events for a non-thinking text part."""
         text = part.get("text")
         if not isinstance(text, str) or not text:
             return
+
+        # Retain content for build() (RFC-0023 §阶段 ③).
+        self._content_text_parts.append(text)
 
         self._ensure_message_started()
         # Close any open thinking block first so block ordering is preserved
@@ -223,7 +337,7 @@ class GeminiRestEventAggregator:
             )
         )
 
-    def _handle_thinking_part(self, part: dict[str, object]) -> None:
+    def _handle_thinking_part(self, part: GeminiPart) -> None:
         """Emit thinking content events for a thought=true text part."""
         # Gemini may emit thoughtSignature on the same part or a sibling part;
         # capture whenever seen and attach to the End event.
@@ -233,6 +347,9 @@ class GeminiRestEventAggregator:
         text = part.get("text")
         if not isinstance(text, str) or not text:
             return
+
+        # Retain content for build() (RFC-0023 §阶段 ③).
+        self._reasoning_text_parts.append(text)
 
         self._ensure_message_started()
 
@@ -255,23 +372,28 @@ class GeminiRestEventAggregator:
             )
         )
 
-    def _handle_function_call_part(self, part: dict[str, object]) -> None:
+    def _handle_function_call_part(self, part: GeminiPart) -> None:
         """Emit tool call events for a functionCall part.
 
         Gemini sends complete function calls (not deltas), so we emit
         START + ARGS + END in sequence for each function call.
         """
         fc = part.get("functionCall")
-        if not isinstance(fc, dict):
-            return
-        fc_dict = cast(dict[str, object], fc)
-
-        name = fc_dict.get("name")
-        if not isinstance(name, str):
+        if not isinstance(fc, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
             return
 
-        args_raw = fc_dict.get("args", {})
-        args = cast(dict[str, object], args_raw) if isinstance(args_raw, dict) else {}
+        name = fc.get("name")
+        if not isinstance(name, str):  # pyright: ignore[reportUnnecessaryIsInstance]
+            return
+
+        args_raw = fc.get("args", {})
+        args: dict[str, object] = args_raw if isinstance(args_raw, dict) else {}  # pyright: ignore[reportUnnecessaryIsInstance]
+
+        # Retain the full part for build() (RFC-0023 §阶段 ③). Mirror Set B's
+        # GeminiRestStreamAggregator: it stores the full part (not just the
+        # functionCall) so any sibling fields (thoughtSignature attached to
+        # the same part) survive into the rebuilt response.
+        self._tool_call_parts.append(part)
 
         self._ensure_message_started()
         # Close any open thinking block first so the tool block ordering

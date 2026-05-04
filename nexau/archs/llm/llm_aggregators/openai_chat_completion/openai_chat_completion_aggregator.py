@@ -262,6 +262,15 @@ class _ChoiceAggregator(Aggregator[ChatCompletionChunkChoice, ChatCompletionChoi
         self._thinking_message_id: str | None = None
         self._thinking_started = False
         self._thinking_ended = False
+        # Retain reasoning text + details for build() (RFC-0023 §阶段 ③).
+        # Two parallel wire formats from OpenAI-compatible providers:
+        #   - reasoning_content (str): DeepSeek / Qwen / vLLM
+        #   - reasoning_details (list[dict]): OpenRouter
+        # Both are non-standard extensions of ChatCompletionMessage; we
+        # attach them to the built message via the SDK's pydantic
+        # ``model_extra`` (extra="allow" on the SDK's ConfiguredBaseModel).
+        self._reasoning_content_parts: list[str] = []
+        self._reasoning_details: list[dict[str, object]] = []
 
     @property
     def finish_reason(self) -> str | None:
@@ -381,6 +390,15 @@ class _ChoiceAggregator(Aggregator[ChatCompletionChunkChoice, ChatCompletionChoi
         # Set tool calls with type assertion to handle union type
         self._value.message.tool_calls = built_tool_calls
 
+        # Attach reasoning fields (RFC-0023 §阶段 ③). ChatCompletionMessage
+        # is an OpenAI SDK Pydantic model with extra="allow", so non-standard
+        # provider extension fields ride along through model_dump and are
+        # picked up by ModelResponse.from_openai_message via getattr.
+        if self._reasoning_content_parts:
+            object.__setattr__(self._value.message, "reasoning_content", "".join(self._reasoning_content_parts))
+        if self._reasoning_details:
+            object.__setattr__(self._value.message, "reasoning_details", list(self._reasoning_details))
+
         # Return the complete choice
         return self._value.model_copy(deep=True)
 
@@ -398,6 +416,8 @@ class _ChoiceAggregator(Aggregator[ChatCompletionChunkChoice, ChatCompletionChoi
         self._thinking_message_id = None
         self._thinking_started = False
         self._thinking_ended = False
+        self._reasoning_content_parts.clear()
+        self._reasoning_details.clear()
 
     def _extract_reasoning_delta(self, delta: ChoiceDelta) -> str:
         """Pull a display-text delta out of ChoiceDelta.model_extra for thinking events.
@@ -433,6 +453,27 @@ class _ChoiceAggregator(Aggregator[ChatCompletionChunkChoice, ChatCompletionChoi
 
     def _aggregate_reasoning(self, delta: ChoiceDelta) -> None:
         """Emit Thinking* events for reasoning_content deltas."""
+        # Retain raw reasoning fields for build() (RFC-0023 §阶段 ③).
+        extra = delta.model_extra or {}
+        rc_raw = extra.get("reasoning_content")
+        if isinstance(rc_raw, str) and rc_raw:
+            self._reasoning_content_parts.append(rc_raw)
+        elif isinstance(rc_raw, list):
+            # DeepSeek/Qwen sometimes ship reasoning_content as a list of
+            # ``{text: ...}`` blocks. Flatten the text into the running string
+            # to mirror Set B's behavior, but ALSO preserve the structured
+            # list under reasoning_details if needed downstream.
+            for item in cast(list[object], rc_raw):
+                if isinstance(item, dict):
+                    text = cast(dict[str, object], item).get("text")
+                    if isinstance(text, str) and text:
+                        self._reasoning_content_parts.append(text)
+        rd_raw = extra.get("reasoning_details")
+        if isinstance(rd_raw, list):
+            for item in cast(list[object], rd_raw):
+                if isinstance(item, dict):
+                    self._reasoning_details.append(dict(cast(dict[str, object], item)))
+
         reasoning_delta = self._extract_reasoning_delta(delta)
         if not reasoning_delta:
             return
