@@ -17,7 +17,7 @@ Unit tests for agent components.
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -31,6 +31,7 @@ from nexau.archs.main_sub.context_value import ContextValue
 from nexau.archs.main_sub.execution.middleware.context_compaction import ContextCompactionMiddleware
 from nexau.archs.main_sub.execution.model_response import ModelResponse, ModelToolCall
 from nexau.archs.main_sub.skill import Skill
+from nexau.archs.sandbox.base_sandbox import LocalSandboxConfig
 from nexau.archs.tool import Tool
 from nexau.archs.tool.tool_registry import ToolRegistry
 from nexau.archs.tracer.core import BaseTracer, Span, SpanType
@@ -613,6 +614,71 @@ class TestAgent:
                 assert agent.history[-1].role == Role.ASSISTANT
                 assert agent.history[-1].get_text_content() == "Test response"
                 mock_execute.assert_called_once()
+
+    def test_root_agent_manages_sandbox_keepalive_with_status_none(self, agent_config, global_storage, tmp_path):
+        """Root/caller agent should still run sandbox lifecycle hooks for status_after_run=none."""
+        agent_config.sandbox_config = LocalSandboxConfig(
+            work_dir=str(tmp_path),
+            status_after_run="none",
+        )
+
+        with patch("nexau.archs.main_sub.agent.openai") as mock_openai:
+            mock_openai.OpenAI.return_value = Mock()
+            agent = Agent(config=agent_config, global_storage=global_storage)
+
+            with (
+                patch.object(agent.sandbox_manager, "on_run_complete") as mock_on_run_complete,
+                patch.object(agent.sandbox_manager, "pause_no_wait") as mock_pause_no_wait,
+                patch.object(agent.sandbox_manager, "stop") as mock_stop,
+                patch.object(agent.executor, "execute_async", new_callable=AsyncMock) as mock_execute,
+            ):
+                mock_execute.return_value = (
+                    "ok",
+                    [Message.user("hello"), Message.assistant("ok")],
+                )
+
+                response = agent.run(message="hello")
+
+                assert response == "ok"
+                mock_on_run_complete.assert_called_once_with()
+                mock_pause_no_wait.assert_not_called()
+                mock_stop.assert_not_called()
+
+    @pytest.mark.parametrize("status_after_run", ["none", "pause", "stop"])
+    def test_sub_agent_never_manages_sandbox_lifecycle(
+        self,
+        agent_config,
+        global_storage,
+        tmp_path,
+        status_after_run: Literal["none", "pause", "stop"],
+    ):
+        """Sub-agent completion must not stop keepalive, pause, or stop the caller-owned sandbox."""
+        agent_config.sandbox_config = LocalSandboxConfig(
+            work_dir=str(tmp_path),
+            status_after_run=status_after_run,
+        )
+
+        with patch("nexau.archs.main_sub.agent.openai") as mock_openai:
+            mock_openai.OpenAI.return_value = Mock()
+            agent = Agent(config=agent_config, global_storage=global_storage, is_root=False)
+
+            with (
+                patch.object(agent.sandbox_manager, "on_run_complete") as mock_on_run_complete,
+                patch.object(agent.sandbox_manager, "pause_no_wait") as mock_pause_no_wait,
+                patch.object(agent.sandbox_manager, "stop") as mock_stop,
+                patch.object(agent.executor, "execute_async", new_callable=AsyncMock) as mock_execute,
+            ):
+                mock_execute.return_value = (
+                    "ok",
+                    [Message.user("hello"), Message.assistant("ok")],
+                )
+
+                response = agent.run(message="hello")
+
+                assert response == "ok"
+                mock_on_run_complete.assert_not_called()
+                mock_pause_no_wait.assert_not_called()
+                mock_stop.assert_not_called()
 
     def test_stop_tool_history_keeps_tool_result_for_next_round(self, global_storage):
         """Regression: if execution stops on a stop_tool, history must retain a tool-result message.

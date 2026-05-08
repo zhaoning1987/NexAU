@@ -140,17 +140,30 @@ class CLIEnabledSubAgentManager(SubAgentManager):
 
         sub_agent_config = self.sub_agents[sub_agent_name]
         parent_agent_id = parent_agent_state.agent_id if parent_agent_state else None
+        caller_sandbox_manager = parent_agent_state.sandbox_manager if parent_agent_state is not None else None
 
         # Create sub-agent with optional recall by ID (uses agent_repo for persistence)
-        sub_agent = Agent(
-            agent_id=sub_agent_id,
-            config=sub_agent_config,
-            global_storage=self.global_storage,
-            session_manager=self.session_manager,
-            user_id=self.user_id,
-            session_id=self.session_id,
-            is_root=False,
-        )
+        if caller_sandbox_manager is not None:
+            sub_agent = Agent(
+                agent_id=sub_agent_id,
+                config=sub_agent_config,
+                global_storage=self.global_storage,
+                session_manager=self.session_manager,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                is_root=False,
+                sandbox_manager=caller_sandbox_manager,
+            )
+        else:
+            sub_agent = Agent(
+                agent_id=sub_agent_id,
+                config=sub_agent_config,
+                global_storage=self.global_storage,
+                session_manager=self.session_manager,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                is_root=False,
+            )
 
         actual_sub_agent_id = sub_agent.agent_id
         self.running_sub_agents[actual_sub_agent_id] = sub_agent

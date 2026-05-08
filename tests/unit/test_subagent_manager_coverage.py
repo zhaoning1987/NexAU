@@ -22,7 +22,10 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from nexau.archs.main_sub.agent_context import AgentContext, GlobalStorage
+from nexau.archs.main_sub.agent_state import AgentState
 from nexau.archs.main_sub.execution.subagent_manager import SubAgentManager
+from nexau.archs.tool.tool_registry import ToolRegistry
 
 
 class TestSubAgentManagerAsync:
@@ -120,3 +123,42 @@ class TestSubAgentManagerAsync:
         assert "parallel result" in result
         stored_id = agent_state.global_storage.get("parallel_execution_id")
         assert stored_id == "exec-123"
+
+    @pytest.mark.anyio
+    @patch("nexau.archs.main_sub.agent_context.get_context")
+    async def test_call_sub_agent_async_uses_caller_sandbox_manager(self, mock_get_context, subagent_manager, sub_agent_config):
+        mock_get_context.return_value = None
+        sandbox_manager = Mock(name="caller_sandbox_manager")
+        parent_state = AgentState(
+            agent_name="parent",
+            agent_id="parent-id",
+            run_id="run-id",
+            root_run_id="run-id",
+            context=AgentContext({}),
+            global_storage=GlobalStorage(),
+            tool_registry=ToolRegistry(),
+            sandbox_manager=sandbox_manager,
+        )
+        mock_sub_agent = Mock()
+        mock_sub_agent.agent_name = "test_sub_agent"
+        mock_sub_agent.agent_id = "sub-async-shared"
+        mock_sub_agent.run_async = AsyncMock(return_value="shared result")
+
+        with patch("nexau.archs.main_sub.agent.Agent.create", new_callable=AsyncMock, return_value=mock_sub_agent) as mock_create:
+            result = await subagent_manager.call_sub_agent_async(
+                "test_sub_agent",
+                "msg",
+                parent_agent_state=parent_state,
+            )
+
+        assert "shared result" in result
+        mock_create.assert_awaited_once_with(
+            config=sub_agent_config,
+            agent_id=None,
+            global_storage=subagent_manager.global_storage,
+            session_manager=subagent_manager.session_manager,
+            user_id=subagent_manager.user_id,
+            session_id=subagent_manager.session_id,
+            is_root=False,
+            sandbox_manager=sandbox_manager,
+        )

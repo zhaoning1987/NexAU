@@ -334,6 +334,51 @@ class TestCLIEnabledSubAgentManager:
 
     @patch("nexau.cli.cli_subagent_adapter.Agent")
     @patch("nexau.cli.cli_subagent_adapter.get_context")
+    def test_call_sub_agent_uses_caller_sandbox_manager(self, mock_get_context, mock_agent_class):
+        """CLI sub-agent should reuse the caller-owned sandbox manager."""
+        mock_config = MagicMock(spec=AgentConfig)
+        mock_config.name = "test_sub_agent"
+        sandbox_manager = Mock(name="caller_sandbox_manager")
+        parent_agent_state = Mock()
+        parent_agent_state.agent_id = "parent-id"
+        parent_agent_state.sandbox_manager = sandbox_manager
+
+        manager = CLIEnabledSubAgentManager(
+            agent_name="parent_agent",
+            sub_agents={"sub1": mock_config},
+        )
+
+        mock_agent = Mock()
+        mock_agent.agent_id = "agent_123"
+        mock_agent.agent_name = "sub1"
+        mock_agent.config.name = "test_sub_agent"
+        mock_agent.executor.middleware_manager = None
+        mock_agent.executor.subagent_manager = None
+        mock_agent._cli_hooks_injected = False
+        mock_agent.run.return_value = "Result from sub-agent"
+        mock_agent_class.return_value = mock_agent
+        mock_get_context.return_value = None
+
+        result = manager.call_sub_agent(
+            sub_agent_name="sub1",
+            message="Hello sub-agent",
+            parent_agent_state=parent_agent_state,
+        )
+
+        assert "Result from sub-agent" in result
+        mock_agent_class.assert_called_once_with(
+            agent_id=None,
+            config=mock_config,
+            global_storage=manager.global_storage,
+            session_manager=manager.session_manager,
+            user_id=manager.user_id,
+            session_id=manager.session_id,
+            is_root=False,
+            sandbox_manager=sandbox_manager,
+        )
+
+    @patch("nexau.cli.cli_subagent_adapter.Agent")
+    @patch("nexau.cli.cli_subagent_adapter.get_context")
     def test_call_sub_agent_with_explicit_context(self, mock_get_context, mock_agent_class):
         """Test call_sub_agent with explicitly provided context."""
         mock_config = MagicMock(spec=AgentConfig)

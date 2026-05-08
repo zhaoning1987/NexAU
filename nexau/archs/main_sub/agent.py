@@ -810,9 +810,10 @@ class Agent:
         self._is_local_sandbox = isinstance(sandbox_config, LocalSandboxConfig)
 
         if self._shared_sandbox_manager is not None:
-            # 共享模式：使用外部注入的 sandbox_manager（Team 场景）
+            # 共享模式：使用外部注入的 sandbox_manager（Team 或 caller-owned sub-agent 场景）
             self.sandbox_manager: BaseSandboxManager[BaseSandbox] = self._shared_sandbox_manager
-            # 不注册 cleanup_manager，由 Team 统一管理生命周期
+            self._is_local_sandbox = isinstance(self.sandbox_manager, LocalSandboxManager)
+            # 不注册 cleanup_manager，由外部 owner 统一管理生命周期
         else:
             # 独立模式：创建独立 sandbox_manager
             if isinstance(sandbox_config, E2BSandboxConfig):
@@ -1244,9 +1245,10 @@ class Agent:
                 if not self.executor.stop_signal:
                     await self._persist_session_state(ctx.context)
 
-                # Handle sandbox lifecycle after agent execution
-                # 共享 sandbox 由 AgentTeam 统一管理生命周期，单个 agent 不应 stop/pause
-                if self._shared_sandbox_manager is None:
+                # Handle sandbox lifecycle after agent execution.
+                # 共享 sandbox 由 AgentTeam 统一管理；sub-agent 的 sandbox 生命周期
+                # 由 caller/root agent 统一管理，避免并行 sub-agent 完成时停止 keepalive。
+                if self._shared_sandbox_manager is None and self._is_root:
                     self.sandbox_manager.on_run_complete()
 
                     sandbox_config = self.config.sandbox_config
@@ -1258,6 +1260,8 @@ class Agent:
                     else:
                         # Let the caller manage sandbox lifecycle (useful for RL training)
                         logger.info("Sandbox lifecycle managed by caller (status_after_run=none)")
+                elif self._shared_sandbox_manager is None:
+                    logger.info("Sandbox lifecycle managed by caller (sub-agent skips sandbox lifecycle)")
 
                 logger.info(f"✅ Agent '{self.config.name}' completed execution")
                 return response

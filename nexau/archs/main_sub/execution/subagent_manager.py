@@ -109,6 +109,7 @@ class SubAgentManager:
             raise ValueError(error_msg)
 
         sub_agent_config = self.sub_agents[sub_agent_name]
+        caller_sandbox_manager = parent_agent_state.sandbox_manager if parent_agent_state is not None else None
 
         # Recall existing sub-agent by ID (will restore history from agent_repo)
         # 防御性检查：空字符串视为 None（创建新子代理）
@@ -118,25 +119,48 @@ class SubAgentManager:
             )
             # Create new Agent instance with the same agent_id
             # Agent.run() will restore history from agent_repo automatically
-            sub_agent = Agent(
-                agent_id=sub_agent_id,
-                config=sub_agent_config,
-                global_storage=self.global_storage,
-                session_manager=self.session_manager,
-                user_id=self.user_id,
-                session_id=self.session_id,
-                is_root=False,
-            )
+            if caller_sandbox_manager is not None:
+                sub_agent = Agent(
+                    agent_id=sub_agent_id,
+                    config=sub_agent_config,
+                    global_storage=self.global_storage,
+                    session_manager=self.session_manager,
+                    user_id=self.user_id,
+                    session_id=self.session_id,
+                    is_root=False,
+                    sandbox_manager=caller_sandbox_manager,
+                )
+            else:
+                sub_agent = Agent(
+                    agent_id=sub_agent_id,
+                    config=sub_agent_config,
+                    global_storage=self.global_storage,
+                    session_manager=self.session_manager,
+                    user_id=self.user_id,
+                    session_id=self.session_id,
+                    is_root=False,
+                )
         else:
             # Instantiate a new sub-agent (Agent.__init__ handles registration)
-            sub_agent = Agent(
-                config=sub_agent_config,
-                global_storage=self.global_storage,
-                session_manager=self.session_manager,
-                user_id=self.user_id,
-                session_id=self.session_id,
-                is_root=False,
-            )
+            if caller_sandbox_manager is not None:
+                sub_agent = Agent(
+                    config=sub_agent_config,
+                    global_storage=self.global_storage,
+                    session_manager=self.session_manager,
+                    user_id=self.user_id,
+                    session_id=self.session_id,
+                    is_root=False,
+                    sandbox_manager=caller_sandbox_manager,
+                )
+            else:
+                sub_agent = Agent(
+                    config=sub_agent_config,
+                    global_storage=self.global_storage,
+                    session_manager=self.session_manager,
+                    user_id=self.user_id,
+                    session_id=self.session_id,
+                    is_root=False,
+                )
 
         actual_sub_agent_id = sub_agent.agent_id
         self.running_sub_agents[actual_sub_agent_id] = sub_agent
@@ -233,21 +257,34 @@ class SubAgentManager:
             raise ValueError(error_msg)
 
         sub_agent_config = self.sub_agents[sub_agent_name]
+        caller_sandbox_manager = parent_agent_state.sandbox_manager if parent_agent_state is not None else None
 
         # 防御性检查：空字符串视为 None（创建新子代理，自动生成 ID）
         if not sub_agent_id:
             sub_agent_id = None
 
         # 使用 Agent.create() async factory 创建 sub-agent，复用主事件循环
-        sub_agent = await Agent.create(
-            config=sub_agent_config,
-            agent_id=sub_agent_id,
-            global_storage=self.global_storage,
-            session_manager=self.session_manager,
-            user_id=self.user_id,
-            session_id=self.session_id,
-            is_root=False,
-        )
+        if caller_sandbox_manager is not None:
+            sub_agent = await Agent.create(
+                config=sub_agent_config,
+                agent_id=sub_agent_id,
+                global_storage=self.global_storage,
+                session_manager=self.session_manager,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                is_root=False,
+                sandbox_manager=caller_sandbox_manager,
+            )
+        else:
+            sub_agent = await Agent.create(
+                config=sub_agent_config,
+                agent_id=sub_agent_id,
+                global_storage=self.global_storage,
+                session_manager=self.session_manager,
+                user_id=self.user_id,
+                session_id=self.session_id,
+                is_root=False,
+            )
 
         actual_sub_agent_id = sub_agent.agent_id
         self.running_sub_agents[actual_sub_agent_id] = sub_agent

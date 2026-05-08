@@ -21,8 +21,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from nexau.archs.main_sub.agent_context import GlobalStorage
+from nexau.archs.main_sub.agent_context import AgentContext, GlobalStorage
+from nexau.archs.main_sub.agent_state import AgentState
 from nexau.archs.main_sub.execution.subagent_manager import SubAgentManager
+from nexau.archs.tool.tool_registry import ToolRegistry
 
 
 class TestSubAgentManager:
@@ -208,6 +210,49 @@ class TestSubAgentManager:
         assert "sub agent result" in result
         call_args = mock_sub_agent.run.call_args
         assert call_args[1]["parent_agent_state"] == agent_state
+
+    @patch("nexau.archs.main_sub.agent_context.get_context")
+    def test_call_sub_agent_uses_caller_sandbox_manager(
+        self,
+        mock_get_context,
+        subagent_manager,
+        sub_agent_config,
+        mock_sub_agent,
+    ):
+        """Sub-agent should reuse the caller-owned sandbox manager instead of creating its own."""
+        mock_get_context.return_value = None
+        sandbox_manager = Mock(name="caller_sandbox_manager")
+        parent_state = AgentState(
+            agent_name="parent",
+            agent_id="parent-id",
+            run_id="run-id",
+            root_run_id="run-id",
+            context=AgentContext({}),
+            global_storage=GlobalStorage(),
+            tool_registry=ToolRegistry(),
+            sandbox_manager=sandbox_manager,
+        )
+
+        with patch("nexau.archs.main_sub.agent.Agent") as mock_agent_cls:
+            mock_agent_cls.return_value = mock_sub_agent
+            result = subagent_manager.call_sub_agent(
+                "test_sub_agent",
+                "test message",
+                parent_agent_state=parent_state,
+            )
+
+        assert result.startswith("[sub_agent_id: mock_sub_agent_id]")
+        mock_agent_cls.assert_called_once_with(
+            config=sub_agent_config,
+            global_storage=subagent_manager.global_storage,
+            session_manager=subagent_manager.session_manager,
+            user_id=subagent_manager.user_id,
+            session_id=subagent_manager.session_id,
+            is_root=False,
+            sandbox_manager=sandbox_manager,
+        )
+        call_args = mock_sub_agent.run.call_args
+        assert call_args[1]["parent_agent_state"] is parent_state
 
     @patch("nexau.archs.main_sub.agent_context.get_context")
     def test_call_sub_agent_with_global_storage(

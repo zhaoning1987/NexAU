@@ -97,6 +97,11 @@ class AgentState:
         """SubAgentManager instance for Agent tool access."""
         return self._subagent_manager
 
+    @property
+    def sandbox_manager(self) -> Optional["BaseSandboxManager[Any]"]:
+        """Sandbox manager owned by the current caller/root agent."""
+        return self._sandbox_manager
+
     def get_context_value(self, key: str, default: Any = None) -> Any:
         """Get a value from the context.
 
