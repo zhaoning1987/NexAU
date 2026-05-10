@@ -1,0 +1,13 @@
+# Synthetic SSE fixture — 模拟一个 provider 把 tool_call 拆成
+# (id+arguments, no name) → (name + more arguments) → (finish_reason)
+# 三段下发的场景。生产环境中 trace_id=71bfa4941837b0ebbb3a03231dd78479
+# 复现的就是这个 chunk 顺序，触发了 ToolCallArgsEvent 早于
+# ToolCallStartEvent 的事件流，导致 NAC playground 右栏短暂显示
+# tool name = 'unknown'。修复后 ARGS 必须缓存到 START 之后再发。
+data: {"id":"chatcmpl-buf","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_buf_001","function":{"name":null,"arguments":"{\"path\""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-buf","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":": \"a.py\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-buf","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]

@@ -602,6 +602,14 @@ class _ToolCallAggregator(Aggregator[ChoiceDeltaToolCall, ChatCompletionMessageT
         self._started = False
         self._ended = False
         self._json_state: Literal["init", "in_object", "complete"] = "init"
+        # Args deltas accumulated while waiting for tool name to arrive.
+        # Some providers send id+arguments before name, in which case
+        # emitting ToolCallArgsEvent immediately leaves downstream
+        # consumers (live UI) seeing arguments for an unknown tool —
+        # they fall back to a placeholder name. We buffer these deltas
+        # and flush them as a single ToolCallArgsEvent right after the
+        # ToolCallStartEvent fires.
+        self._pending_args: list[str] = []
 
     def aggregate(self, item: ChoiceDeltaToolCall) -> None:
         """
@@ -651,21 +659,39 @@ class _ToolCallAggregator(Aggregator[ChoiceDeltaToolCall, ChatCompletionMessageT
                         timestamp=int(datetime.now().timestamp() * 1000),
                     )
                 )
+                # 之前缓存的 args delta（在 START 之前到达的 id+arguments
+                # chunk）一次性补发，保持事件流"START → ARGS …"顺序。
+                if self._pending_args:
+                    flushed = "".join(self._pending_args)
+                    self._pending_args.clear()
+                    self._on_event(
+                        ToolCallArgsEvent(
+                            tool_call_id=self._value.id,
+                            delta=flushed,
+                            timestamp=int(datetime.now().timestamp() * 1000),
+                        )
+                    )
 
             if fn.name:
                 self._value.function.name = fn.name
 
             if fn.arguments:
                 self._value.function.arguments += fn.arguments
-                # Emit ToolCallArgsEvent
-                self._on_event(
-                    ToolCallArgsEvent(
-                        tool_call_id=self._value.id,
-                        delta=fn.arguments,
-                        timestamp=int(datetime.now().timestamp() * 1000),
+                if self._started:
+                    # 正常路径：name 已知，直接发 ARGS。
+                    self._on_event(
+                        ToolCallArgsEvent(
+                            tool_call_id=self._value.id,
+                            delta=fn.arguments,
+                            timestamp=int(datetime.now().timestamp() * 1000),
+                        )
                     )
-                )
-                # Update JSON state
+                else:
+                    # name 还没到（部分 provider 把 name 放在后续 chunk）。
+                    # 缓存 delta，等 START 发出时一起 flush。
+                    self._pending_args.append(fn.arguments)
+                # Update JSON state regardless — tracks bracket-balanced JSON
+                # against the accumulated `_value.function.arguments`.
                 self._update_json_state()
 
         # Emit tool call end event once when JSON is complete AND start was emitted
@@ -704,6 +730,17 @@ class _ToolCallAggregator(Aggregator[ChoiceDeltaToolCall, ChatCompletionMessageT
                     timestamp=int(datetime.now().timestamp() * 1000),
                 )
             )
+            # 兜底路径下 args 通常已通过缓存累积；START 后一次性补发。
+            if self._pending_args:
+                flushed = "".join(self._pending_args)
+                self._pending_args.clear()
+                self._on_event(
+                    ToolCallArgsEvent(
+                        tool_call_id=self._value.id,
+                        delta=flushed,
+                        timestamp=int(datetime.now().timestamp() * 1000),
+                    )
+                )
         if self._started and not self._ended:
             self._ended = True
             self._on_event(

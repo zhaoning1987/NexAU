@@ -854,6 +854,186 @@ class TestOpenAIChatCompletionAggregator:
         assert len(start_events) == 1
         assert start_events[0][0][0].tool_call_name == "get_weather"
 
+    def test_args_before_name_buffered_until_start(self):
+        """Args deltas arriving before the tool name must NOT be emitted
+        as ``ToolCallArgsEvent`` immediately — that leaves live consumers
+        (UI aggregators) seeing args for an unknown tool, which they
+        render with a placeholder name. Buffer them and flush right
+        after ``ToolCallStartEvent`` fires, preserving START → ARGS
+        order.
+
+        Reproduces the production bug observed on
+        trace_id=71bfa4941837b0ebbb3a03231dd78479 where a tool call
+        briefly rendered as ``'unknown'`` on the playground compare
+        panel before settling to its real name once persisted
+        run_actions caught up.
+
+        Fixture-driven: the chunk sequence lives in
+        ``tests/unit/fixtures/openai_chat/tool_call_args_before_name.sse``
+        as a tiny synthetic SSE stream — same parser as the parity
+        recordings, so we don't reinvent chunk construction.
+        """
+        from tests.unit._chat_fixture_runner import run_chat_fixture
+
+        events, response = run_chat_fixture("tool_call_args_before_name")
+
+        # 1. First tool-call event must be START (no ARGS leak before it).
+        tc_events = [e for e in events if e.__class__.__name__.startswith("ToolCall")]
+        assert tc_events, "expected at least one tool-call event"
+        assert tc_events[0].__class__.__name__ == "ToolCallStartEvent", (
+            f"first TC event was {tc_events[0].__class__.__name__}, expected ToolCallStartEvent — args delta leaked before START (the bug)"
+        )
+
+        # 2. Exactly one START with the right name + id.
+        start_events = [e for e in events if e.__class__.__name__ == "ToolCallStartEvent"]
+        assert len(start_events) == 1
+        assert start_events[0].tool_call_id == "call_buf_001"
+        assert start_events[0].tool_call_name == "read_file"
+
+        # 3. ARGS deltas reconstruct to the full original args string
+        #    (buffered chunk-1 fragment + chunk-2 fragment, in order).
+        args_events = [e for e in events if e.__class__.__name__ == "ToolCallArgsEvent"]
+        assert "".join(e.delta for e in args_events) == '{"path": "a.py"}'
+
+        # 4. Built response carries the fully-aggregated tool call —
+        #    persistence path was always correct; this is just a guard.
+        tool_calls = response.choices[0].message.tool_calls
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert tool_calls[0].function.arguments == '{"path": "a.py"}'
+
+    def test_parallel_tool_calls_one_args_before_name(self):
+        """Two parallel tool calls in the same response. Tool index=0 has
+        the args-before-name race; tool index=1 is well-formed.
+
+        Both must:
+        - emit exactly one START with the correct name (no 'unknown' leak),
+        - have their ARGS reconstruct to the full args string,
+        - end up in ``response.choices[0].message.tool_calls`` in the right
+          order.
+
+        Order of START emission is wire-order: tool 1's START fires in
+        chunk 1 (its name was present); tool 0's START is delayed until
+        chunk 2 when its name finally lands.
+        """
+        from tests.unit._chat_fixture_runner import run_chat_fixture
+
+        events, response = run_chat_fixture("parallel_tool_calls_one_args_before_name")
+
+        starts = [e for e in events if e.__class__.__name__ == "ToolCallStartEvent"]
+        # Two distinct tools, two distinct STARTs, both with real names.
+        assert len(starts) == 2
+        names_by_id = {e.tool_call_id: e.tool_call_name for e in starts}
+        assert names_by_id == {"call_clean": "calculator", "call_racy": "web_search"}
+
+        # No leaked 'unknown' anywhere.
+        assert all(e.tool_call_name != "unknown" for e in starts)
+
+        # Wire-order: clean fires first (name in chunk 1), racy second.
+        assert [s.tool_call_id for s in starts] == ["call_clean", "call_racy"]
+
+        # Args reconstruct per tool.
+        args_by_id: dict[str, str] = {}
+        for ev in events:
+            if ev.__class__.__name__ != "ToolCallArgsEvent":
+                continue
+            args_by_id[ev.tool_call_id] = args_by_id.get(ev.tool_call_id, "") + ev.delta
+        assert args_by_id["call_clean"] == '{"expr":"1+1"}'
+        assert args_by_id["call_racy"] == '{"q":"hello"}'
+
+        # Built response: same data, persisted view.
+        tool_calls = response.choices[0].message.tool_calls
+        assert tool_calls is not None
+        by_id = {tc.id: tc for tc in tool_calls}
+        assert by_id["call_clean"].function.name == "calculator"
+        assert by_id["call_clean"].function.arguments == '{"expr":"1+1"}'
+        assert by_id["call_racy"].function.name == "web_search"
+        assert by_id["call_racy"].function.arguments == '{"q":"hello"}'
+
+    def test_tool_call_name_arrives_in_chunk_3(self):
+        """Args arrive in chunk 1 AND chunk 2 before name lands in chunk 3.
+        The buffer must hold multiple fragments and concatenate them when
+        START finally fires — not just the last fragment.
+        """
+        from tests.unit._chat_fixture_runner import run_chat_fixture
+
+        events, response = run_chat_fixture("tool_call_name_arrives_in_chunk_3")
+
+        # First TC event must be START.
+        tc_events = [e for e in events if e.__class__.__name__.startswith("ToolCall")]
+        assert tc_events[0].__class__.__name__ == "ToolCallStartEvent"
+
+        starts = [e for e in events if e.__class__.__name__ == "ToolCallStartEvent"]
+        assert len(starts) == 1
+        assert starts[0].tool_call_name == "read_file"
+        assert starts[0].tool_call_id == "call_late"
+
+        # Concatenated ARGS must equal the full pre-flush + post-flush stream:
+        # chunk 1: '{"path' + chunk 2: '":"' + chunk 3: 'main.py"}'
+        args_events = [e for e in events if e.__class__.__name__ == "ToolCallArgsEvent"]
+        assert "".join(e.delta for e in args_events) == '{"path":"main.py"}'
+
+        tc = response.choices[0].message.tool_calls
+        assert tc is not None and len(tc) == 1
+        assert tc[0].function.name == "read_file"
+        assert tc[0].function.arguments == '{"path":"main.py"}'
+
+    def test_tool_call_no_name_until_finish_uses_unknown_fallback(self):
+        """If `function.name` never arrives in the stream, ``ensure_ended``
+        emits a late START with name='unknown' once ``finish_reason`` lands.
+        Buffered args still flush in order.
+
+        This documents the absolute worst-case behaviour — pre-fix the
+        args leaked one-by-one as 'unknown'-named events; post-fix they
+        buffer and emit cleanly together. We assert on the live event
+        stream only; ``aggregator.build()`` deliberately *raises* in this
+        case because a nameless tool call can't be persisted (you can't
+        invoke "function `''`" downstream). The 'unknown' fallback exists
+        purely so the live UI doesn't render half-baked state mid-stream.
+        """
+        from collections.abc import Callable
+        from pathlib import Path
+
+        from openai.types.chat import ChatCompletionChunk
+
+        from nexau.archs.llm.llm_aggregators import (
+            Event,
+            OpenAIChatCompletionAggregator,
+        )
+        from tests.aggregator_parity.sse_loader import _parse_sse_blocks
+
+        # Inline the loader because run_chat_fixture calls build() which
+        # would raise here. We need the events but expect build() to fail.
+        path = Path(__file__).resolve().parent / "fixtures" / "openai_chat" / "tool_call_no_name_until_finish.sse"
+        chunk_dicts = _parse_sse_blocks(path.read_text(encoding="utf-8"))
+        chunks = [ChatCompletionChunk.model_validate(d) for d in chunk_dicts]
+
+        events: list[Event] = []
+        capture: Callable[[Event], None] = events.append
+        agg = OpenAIChatCompletionAggregator(on_event=capture, run_id="test-run")
+        for chunk in chunks:
+            agg.aggregate(chunk)
+
+        starts = [e for e in events if e.__class__.__name__ == "ToolCallStartEvent"]
+        assert len(starts) == 1
+        # No real name was ever sent → fallback.
+        assert starts[0].tool_call_name == "unknown"
+        assert starts[0].tool_call_id == "call_noname"
+
+        # First tool-call-related event must still be START (not ARGS).
+        tc_events = [e for e in events if e.__class__.__name__.startswith("ToolCall")]
+        assert tc_events[0].__class__.__name__ == "ToolCallStartEvent"
+
+        # Args reconstruct.
+        args_events = [e for e in events if e.__class__.__name__ == "ToolCallArgsEvent"]
+        assert "".join(e.delta for e in args_events) == '{"a":1,"b":2}'
+
+        # Persistence boundary: build() refuses to materialise a nameless
+        # tool call. This is the right behaviour — a missing name is
+        # nondeterministic provider data, not something to persist as ''.
+        with pytest.raises(ValueError, match="never received valid tool call data"):
+            agg.build()
+
     def test_tool_call_ended_flag_prevents_duplicate_end_events(self):
         """Test that _ended flag prevents duplicate ToolCallEndEvent.
 

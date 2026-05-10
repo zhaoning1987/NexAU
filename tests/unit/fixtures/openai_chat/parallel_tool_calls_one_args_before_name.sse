@@ -1,0 +1,14 @@
+# Parallel tool calls — OpenAI streams them at different `index` values so each
+# has its own _ToolCallAggregator.  Tool 0 (index=0) is the racy one: id+args
+# arrive before name. Tool 1 (index=1) is well-formed (id+name in first chunk).
+#
+# Both tools must emit a single ToolCallStartEvent with the correct name, in
+# the order their START events fire — i.e. tool 1's START fires first because
+# its name arrives in chunk 1; tool 0's START is delayed until chunk 2.
+data: {"id":"chatcmpl-par","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_racy","function":{"name":null,"arguments":"{\"q\":\""}},{"index":1,"id":"call_clean","function":{"name":"calculator","arguments":"{\"expr\""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-par","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"web_search","arguments":"hello\"}"}},{"index":1,"function":{"arguments":":\"1+1\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-par","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]

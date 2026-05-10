@@ -1,0 +1,14 @@
+# The pathological case some early models / proxies hit: id and args stream
+# in but `function.name` never arrives. When `finish_reason: tool_calls` lands
+# the choice aggregator calls _ToolCallAggregator.ensure_ended(), which is
+# expected to:
+#   1. emit a late ToolCallStartEvent with name='unknown' (warn-logged)
+#   2. flush any buffered args with the synthetic name
+#   3. emit ToolCallEndEvent
+data: {"id":"chatcmpl-noname","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_noname","function":{"name":null,"arguments":"{\"a\":1"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-noname","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":",\"b\":2}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-noname","object":"chat.completion.chunk","created":1234567890,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
