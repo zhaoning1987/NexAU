@@ -61,22 +61,21 @@ class TestCheckPathPermission:
         check_path_permission(ctx, "/etc/passwd")
 
     # CC 对齐: 保护路径
-    def test_protected_dir_asks_even_with_wildcard(self) -> None:
+    # 注: _PROTECTED_DIRS / _PROTECTED_FILES 当前被清空以恢复 RFC-0019
+    # 的向后兼容承诺（无 permissions 字段 = "**" 无条件放行）。等更细的
+    # opt-in 策略落地后，把下面三个用例翻回 pytest.raises(AskPermission)。
+    def test_protected_dir_passes_with_wildcard(self) -> None:
         ctx = FrameworkContext.for_testing(allow_rules=["**"])
-        with pytest.raises(AskPermission):
-            check_path_permission(ctx, "/project/.git/config")
+        check_path_permission(ctx, "/project/.git/config")
 
-    def test_protected_file_asks_even_with_allow(self) -> None:
+    def test_protected_file_passes_with_allow(self) -> None:
         ctx = FrameworkContext.for_testing(allow_rules=["/home/**"], deny_rules=[])
-        with pytest.raises(AskPermission) as exc_info:
-            check_path_permission(ctx, "/home/user/.bashrc")
-        assert exc_info.value.permission_key == "/home/user/.bashrc"
+        check_path_permission(ctx, "/home/user/.bashrc")
 
-    def test_protected_dirs_all_covered(self) -> None:
+    def test_protected_dirs_all_pass_with_wildcard(self) -> None:
         ctx = FrameworkContext.for_testing(allow_rules=["**"])
         for d in [".git", ".vscode", ".idea", ".husky", ".claude"]:
-            with pytest.raises(AskPermission):
-                check_path_permission(ctx, f"/project/{d}/something")
+            check_path_permission(ctx, f"/project/{d}/something")
 
     def test_non_protected_path_passes_with_wildcard(self) -> None:
         ctx = FrameworkContext.for_testing(allow_rules=["**"])

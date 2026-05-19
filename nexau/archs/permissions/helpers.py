@@ -147,29 +147,22 @@ _PROCESS_WRAPPERS: frozenset[str] = frozenset(
 )
 
 # CC 对齐: 写文件保护路径 — 即使目录已 allow 也强制 ask
-_PROTECTED_DIRS: frozenset[str] = frozenset(
-    {
-        ".git",
-        ".vscode",
-        ".idea",
-        ".husky",
-        ".claude",
-    }
-)
-_PROTECTED_FILES: frozenset[str] = frozenset(
-    {
-        ".gitconfig",
-        ".gitmodules",
-        ".bashrc",
-        ".bash_profile",
-        ".zshrc",
-        ".zprofile",
-        ".profile",
-        ".ripgreprc",
-        ".mcp.json",
-        ".claude.json",
-    }
-)
+#
+# 暂时清空：原"保护路径强制 ask"机制与 RFC-0019 的"无 permissions 字段 = 行为与
+# 当前一致（`"**"` 无条件放行）"承诺冲突——未声明 permissions 的 tool 走到
+# check_path_permission 时，本应被 `"**"` 短路，却因保护路径检查再被拦下 ask。
+# 在更细的策略（按 tool opt-in 启用保护、仅 workspace root 生效等）落地前，
+# 先把两个集合清空以恢复向后兼容承诺。
+#
+# 原内容保留为注释以便日后恢复：
+# _PROTECTED_DIRS = {".git", ".vscode", ".idea", ".husky", ".claude"}
+# _PROTECTED_FILES = {
+#     ".gitconfig", ".gitmodules",
+#     ".bashrc", ".bash_profile", ".zshrc", ".zprofile", ".profile",
+#     ".ripgreprc", ".mcp.json", ".claude.json",
+# }
+_PROTECTED_DIRS: frozenset[str] = frozenset()
+_PROTECTED_FILES: frozenset[str] = frozenset()
 
 
 def check_permission(
