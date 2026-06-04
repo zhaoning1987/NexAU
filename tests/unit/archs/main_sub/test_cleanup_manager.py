@@ -89,3 +89,53 @@ def test_signal_handler_cleans_resources_before_platform_reemit(monkeypatch) -> 
     sandbox_manager.stop.assert_called_once_with()
     agent.sync_cleanup.assert_called_once_with()
     reemit_mock.assert_called_once_with(signal.SIGINT)
+
+
+@pytest.mark.parametrize(
+    ("action_env", "expect_stop", "expect_pause"),
+    [
+        ("none", False, False),  # 不触碰 sandbox（NAC 用此值，#932 修复）
+        ("pause", False, True),  # best-effort 暂停
+        ("stop", True, False),  # 显式 stop
+        ("  STOP  ", True, False),  # strip + lower 归一
+        ("kill", True, False),  # 非法值回落 stop
+    ],
+)
+def test_cleanup_sandbox_atexit_action(monkeypatch, action_env, expect_stop, expect_pause) -> None:
+    """RFC-0140: 退出清理按 NEXAU_SANDBOX_ATEXIT_ACTION 三态分发（非法值回落 stop）。
+
+    仅验证分发（调对方法），不验证 pause 真正完成——pause_no_wait 非阻塞、
+    退出路径下 best-effort（解释器可能在 pause 线程完成前退出）。
+    """
+    manager = _fresh_manager()
+    sandbox_manager = Mock()
+    manager._sandbox_manager = sandbox_manager
+    monkeypatch.setenv("NEXAU_SANDBOX_ATEXIT_ACTION", action_env)
+
+    manager._cleanup_sandbox()
+
+    assert sandbox_manager.stop.called is expect_stop
+    assert sandbox_manager.pause_no_wait.called is expect_pause
+
+
+def test_cleanup_sandbox_default_is_stop(monkeypatch) -> None:
+    """RFC-0140: env 缺省时默认 stop（= 历史行为，单机用户零影响）。"""
+    manager = _fresh_manager()
+    sandbox_manager = Mock()
+    manager._sandbox_manager = sandbox_manager
+    monkeypatch.delenv("NEXAU_SANDBOX_ATEXIT_ACTION", raising=False)
+
+    manager._cleanup_sandbox()
+
+    sandbox_manager.stop.assert_called_once_with()
+    sandbox_manager.pause_no_wait.assert_not_called()
+
+
+def test_cleanup_sandbox_none_skips_when_no_manager(monkeypatch) -> None:
+    """RFC-0140: 无 sandbox_manager 时直接 return，不读 env、不报错。"""
+    manager = _fresh_manager()
+    manager._sandbox_manager = None
+    monkeypatch.setenv("NEXAU_SANDBOX_ATEXIT_ACTION", "stop")
+
+    # 不应抛异常
+    manager._cleanup_sandbox()
