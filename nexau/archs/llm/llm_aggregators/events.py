@@ -289,6 +289,22 @@ class CompactionFinishedEvent(BaseEvent):
     fallback: bool = False
 
 
+class ContentBlockedEvent(BaseEvent):
+    """Event emitted when a safety middleware blocks content.
+
+    RFC-0027: 内容安全拦截事件（如敏感词命中）。与终止用的 ``RunErrorEvent``
+    区分——本事件携带拦截的具体信息（来源 / 类别 / 命中词），由中间件在命中
+    那一刻即时发射；run 仍以 ``ERROR_OCCURRED`` 收尾。
+    """
+
+    type: Literal["CONTENT_BLOCKED"] = "CONTENT_BLOCKED"  # type: ignore[assignment]
+    run_id: str
+    source: Literal["input", "output"]
+    categories: list[str]
+    words: list[str]
+    message: str
+
+
 class TransportErrorEvent(BaseEvent):
     """Event indicating a transport-level error (e.g. streaming failure).
 
@@ -435,6 +451,7 @@ Event = (
     | RunErrorEvent
     | CompactionStartedEvent
     | CompactionFinishedEvent
+    | ContentBlockedEvent
     | TransportErrorEvent
     # Image events (StartEvent has run_id, others link via message_id)
     | ImageMessageStartEvent
@@ -457,6 +474,7 @@ __all__ = [
     "RunErrorEvent",
     "CompactionStartedEvent",
     "CompactionFinishedEvent",
+    "ContentBlockedEvent",
     "TransportErrorEvent",
     "UsageUpdateEvent",
     "ModelCallFinishedEvent",

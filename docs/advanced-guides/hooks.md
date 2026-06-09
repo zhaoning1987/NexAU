@@ -201,6 +201,7 @@ middlewares:
 - `ContextCompactionMiddleware`: manages conversation context when token limits are approached. See [Context Compaction](./context_compaction.md) for details.
 - `LLMFailoverMiddleware`: automatically fails over to backup LLM providers when the primary provider returns matching errors (e.g. 500, 502, 503). Supports multi-level fallback chains and an optional circuit breaker. See below for configuration.
 - `LongToolOutputMiddleware`: truncates oversized tool outputs and saves the full content to temporary files via the Sandbox API. Useful for tools that may return very large results (e.g. file search, code analysis). See below for configuration.
+- `SensitiveWordMiddleware`: blocks configured sensitive terms in model input, tool results, and model output. See [Sensitive Word Middleware](./sensitive-word-middleware.md) for details.
 
 You can combine built-in middleware with your own; the manager guarantees the ordering rules described above.
 

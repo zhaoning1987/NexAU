@@ -89,6 +89,11 @@ class BeforeModelHookInput:
     # rather than a per-event-type field so adding new event types
     # (``UndoEvent`` / ``AppendEvent`` / future) doesn't churn this schema.
     history_event: HistoryEvent | None = None
+    # RFC-0027: outparam — 与 history_event 同机制。当某个 before_model /
+    # after_model 中间件要求强制停止本次 run（如敏感词命中）时，
+    # MiddlewareManager 把 HookResult.force_stop_reason 回写到这里，
+    # 由 executor 在 hook 边界读取并 BREAK。None 表示无中间件要求停止。
+    force_stop_reason: AgentStopReason | None = None
 
 
 @dataclass
@@ -142,6 +147,11 @@ class HookResult:
     # working — the executor falls back to the existing fingerprint-diff
     # path when this is None.
     history_event: HistoryEvent | None = None
+
+    # RFC-0027: 中间件强制停止信号。before_model / after_model 中间件设置此值时，
+    # MiddlewareManager 会把它 surface 到 hook_input.force_stop_reason（outparam），
+    # executor 据此在 hook 边界终止本次 run，并将该 reason 作为最终停止原因。
+    force_stop_reason: AgentStopReason | None = None
 
     def has_messages(self) -> bool:
         return self.messages is not None
@@ -682,6 +692,8 @@ class MiddlewareManager:
         # RFC-0026: clear the typed-event outparam at the start of each run so
         # stale state from a prior iteration can't leak through.
         hook_input.history_event = None
+        # RFC-0027: same clear-outparam pattern for force-stop.
+        hook_input.force_stop_reason = None
         current_messages = hook_input.messages
         for _, middleware in enumerate(self.middlewares):
             handler = getattr(middleware, "before_model", None)
@@ -700,6 +712,9 @@ class MiddlewareManager:
                 # only one middleware in a chain (compaction) sets this today.
                 if hook_result.history_event is not None:
                     hook_input.history_event = hook_result.history_event
+                # RFC-0027: surface force-stop intent to the executor (last writer wins).
+                if hook_result.force_stop_reason is not None:
+                    hook_input.force_stop_reason = hook_result.force_stop_reason
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.warning(f"⚠️ Before-model middleware {middleware} failed: {exc}")
         return current_messages
@@ -710,6 +725,8 @@ class MiddlewareManager:
     ) -> tuple[ParsedResponse | None, list[Message], bool]:
         # RFC-0026: same clear-outparam pattern as run_before_model.
         hook_input.history_event = None
+        # RFC-0027: same clear-outparam pattern for force-stop.
+        hook_input.force_stop_reason = None
         current_parsed = hook_input.parsed_response
         current_messages = hook_input.messages
         force_continue = False
@@ -732,6 +749,9 @@ class MiddlewareManager:
                     force_continue = True
                 if hook_result.history_event is not None:
                     hook_input.history_event = hook_result.history_event
+                # RFC-0027: surface force-stop intent to the executor (last writer wins).
+                if hook_result.force_stop_reason is not None:
+                    hook_input.force_stop_reason = hook_result.force_stop_reason
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.warning(f"⚠️ After-model middleware {middleware} failed: {exc}")
         return current_parsed, current_messages, force_continue

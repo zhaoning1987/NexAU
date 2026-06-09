@@ -526,6 +526,56 @@ class TestMiddlewareManager:
         assert updated_messages[-1].get_text_content() == "feedback"
         assert force_continue is True
 
+    def test_run_before_model_surfaces_force_stop_reason(self, agent_state, messages):
+        """RFC-0027: before_model HookResult.force_stop_reason is surfaced onto the outparam."""
+
+        def stop_hook(hook_input: BeforeModelHookInput) -> HookResult:
+            return HookResult(force_stop_reason=AgentStopReason.ERROR_OCCURRED)
+
+        manager = MiddlewareManager([FunctionMiddleware(before_model_hook=stop_hook)])
+        hook_input = BeforeModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages.copy(),
+        )
+
+        manager.run_before_model(hook_input)
+        assert hook_input.force_stop_reason is AgentStopReason.ERROR_OCCURRED
+
+    def test_run_before_model_clears_stale_force_stop_reason(self, agent_state, messages):
+        """RFC-0027: stale force_stop_reason from a prior iter is cleared when no middleware sets it."""
+        manager = MiddlewareManager([FunctionMiddleware(before_model_hook=lambda hi: HookResult.no_changes())])
+        hook_input = BeforeModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages.copy(),
+            force_stop_reason=AgentStopReason.ERROR_OCCURRED,  # stale
+        )
+
+        manager.run_before_model(hook_input)
+        assert hook_input.force_stop_reason is None
+
+    def test_run_after_model_surfaces_force_stop_reason(self, agent_state, messages, parsed_response):
+        """RFC-0027: after_model HookResult.force_stop_reason is surfaced onto the outparam."""
+
+        def stop_hook(hook_input: AfterModelHookInput) -> HookResult:
+            return HookResult(force_stop_reason=AgentStopReason.ERROR_OCCURRED)
+
+        manager = MiddlewareManager([FunctionMiddleware(after_model_hook=stop_hook)])
+        hook_input = AfterModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages.copy(),
+            original_response="resp",
+            parsed_response=parsed_response,
+        )
+
+        manager.run_after_model(hook_input)
+        assert hook_input.force_stop_reason is AgentStopReason.ERROR_OCCURRED
+
     def test_run_after_tool_reverse_order(self, agent_state):
         """After-tool hooks execute from last to first."""
         order: list[str] = []

@@ -1,0 +1,31 @@
+type: agent
+name: sensitive_word_demo
+system_prompt: 你是一个简洁的助手，用一句话回答。
+tool_call_mode: xml
+max_iterations: 10
+
+llm_config:
+  model: ${env.LLM_MODEL}
+  base_url: ${env.LLM_BASE_URL}
+  api_key: ${env.LLM_API_KEY}
+  api_type: ${env.LLM_API_TYPE}
+
+middlewares:
+  # 敏感词中间件（RFC-0027）。
+  # lexicon_dir 必须显式配置；不再内置默认词库。
+  # 生产环境把 lexicon_dir 指向你自己的完整词库目录（每个 .txt 文件名即类别）。
+  - import: nexau.archs.main_sub.execution.middleware.sensitive_word:SensitiveWordMiddleware
+    params:
+      lexicon_dir: examples/sensitive_word/sensitive_lexicon   # 示例词库；生产建议改为绝对路径
+      case_sensitive: false      # 英文敏感词建议 false
+      block_input: true          # 拦用户输入（含 tool result）
+      block_output: true         # 拦模型输出
+      raise_on_block: false      # false=返回拒绝文案；true=抛 SensitiveContentBlockedError
+
+# 可选：把 trace 上报 Langfuse（需 LANGFUSE_* 环境变量）。不需要可整段删掉。
+tracers:
+  - import: nexau.archs.tracer.adapters.langfuse:LangfuseTracer
+    params:
+      public_key: ${env.LANGFUSE_PUBLIC_KEY}
+      secret_key: ${env.LANGFUSE_SECRET_KEY}
+      host: ${env.LANGFUSE_HOST}

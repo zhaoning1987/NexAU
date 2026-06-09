@@ -1451,6 +1451,13 @@ class Executor:
                 state.framework_context,
                 before_model_hook_input.history_event,
             )
+            # RFC-0027: before_model 中间件请求强制停止（输入侧拦截）——
+            # 在发起 LLM 调用前短路，不向模型发送请求。
+            if before_model_hook_input.force_stop_reason is not None:
+                return self._apply_middleware_force_stop(
+                    state,
+                    before_model_hook_input.force_stop_reason,
+                )
 
         # 5. 快照工具定义 & token 计算
         tools_payload = None
@@ -1540,6 +1547,16 @@ class Executor:
         )
 
         state.messages = updated_messages
+
+        # RFC-0027: after_model 中间件请求强制停止（输出侧拦截）——
+        # 在写工具结果 / should_stop 判定之前 BREAK，避免停止原因被
+        # NO_MORE_TOOL_CALLS 覆盖。工具调用已在 _process_xml_calls_async 内被
+        # 跳过（见该函数中的 force_stop_reason 短路）。
+        if after_model_hook_input.force_stop_reason is not None:
+            return self._apply_middleware_force_stop(
+                state,
+                after_model_hook_input.force_stop_reason,
+            )
 
         # 9. 构建工具结果消息
         self._append_tool_result_messages(
@@ -1693,6 +1710,25 @@ class Executor:
             if state.token_trace_session is not None:
                 state.token_trace_session.append_messages([tool_result_feedback_message], mask_value=0)
 
+    def _apply_middleware_force_stop(
+        self,
+        state: _AsyncIterationState,
+        reason: AgentStopReason,
+    ) -> _IterationOutcome:
+        """Finalize a run that a before/after_model middleware asked to force-stop.
+
+        RFC-0027: 中间件强制停止收尾
+
+        把停止原因落到 state，并将最后一条消息文本作为最终回复——按约定，
+        请求强制停止的中间件会把面向用户的文案作为末条消息追加/替换（例如
+        敏感词中间件的拒绝回复）。返回 BREAK 让主循环退出。
+        """
+        state.force_stop_reason = reason
+        if state.messages:
+            state.final_response = state.messages[-1].get_text_content()
+        logger.warning("🛑 Middleware force-stop: %s", reason.name)
+        return _IterationOutcome.BREAK
+
     async def _handle_stop_condition_async(
         self,
         state: _AsyncIterationState,
@@ -1822,6 +1858,11 @@ class Executor:
                 framework_context,
                 hook_input.history_event,
             )
+            # RFC-0027: after_model 中间件请求强制停止 —— 在执行任何工具/子代理
+            # 调用前短路。should_stop=True 让上层收尾；真正的停止原因经
+            # hook_input.force_stop_reason（outparam）回传给 _execute_iteration_async。
+            if hook_input.force_stop_reason is not None:
+                return hook_input.original_response, True, None, current_messages, [], []
 
         if not parsed_response or not parsed_response.has_calls():
             if force_continue:

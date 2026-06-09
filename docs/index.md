@@ -27,6 +27,7 @@ NexAU is a general-purpose agent framework for building intelligent agents with 
 * **Advanced Guides**
     * **[Skills](./advanced-guides/hooks.md)**: Skills (compatible with Claude Skill format) to dynamically ingest skill context (support both tool and file).
     * **[Hooks/Middleware](./advanced-guides/hooks.md)**: Intercept and modify agent behavior.
+    * **[Sensitive Word Middleware](./advanced-guides/sensitive-word-middleware.md)**: Block configured sensitive terms in inputs, tool results, and model output.
     * **[Tool Output Formatters](./advanced-guides/tool-formatters.md)**: Control what tool results the model actually sees and how custom formatters interact with middleware.
     * **[Global Storage](./advanced-guides/global-storage.md)**: Share state across tools and agents.
     * **[Templating](./advanced-guides/templating.md)**: Use Jinja2 for dynamic system prompts.
